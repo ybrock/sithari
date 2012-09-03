@@ -1,0 +1,26 @@
+#!/usr/bin/perl
+# @(#) small perl script to help migrating from backup-users to sithari
+# use this script like this :
+#
+# bu-to-sith /etc/backup-users.conf >> /etc/sithari.conf
+#
+# and it will convert the configuration file and add it 
+# at the end of sithari.conf
+
+while (<>)
+	{
+	chomp ;
+
+	s/#.*$// ;
+	next if (m/^\s*$/) ;
+
+	@a = split(/\s+/,$_) ; 
+
+	print "[$a[0]]\n" ;
+	print "\tsource = $a[0]\n" ;
+	print "\tdestination = $a[1]\n" ;
+	print "\tdays = $a[2]\n" ;
+	print "\tmonths = $a[3]\n" ;
+	print "\tyears = $a[4]\n" ;
+	print "\n" ;
+	}

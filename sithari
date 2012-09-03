@@ -1,0 +1,681 @@
+#!/usr/bin/perl -w
+# #############################################################
+#
+# @(#) (C) Sithari - Copyright 2006-2009 - Olivier Dousse, Yvan Broccard
+#          Licensed under the GPL, version 3 or higher.
+#
+# #############################################################
+#
+# Sithari creates a copy of defined directories, accessible 
+# thru SSH localy or remotely, and stores them localy. 
+# Every daily copy is 1st created with hard links of the previous
+# copy, and then it's updated with rsync
+# 
+# The config file is by default /etc/sithari.conf
+# consider putting a call to sithari into the crontab
+# #############################################################
+#
+# needs :
+# - rsync, cpio, ssh, perl, find
+# optional: 
+# - configured ssh access for remote host backup
+# - rsync daemon for rsync access
+# #############################################################
+
+# #############################################################
+# modules
+# #############################################################
+use strict ;
+use File::Path ;
+use Time::Local ;
+use Cwd ;
+
+# #####################################################
+# Global variables declaration
+# #####################################################
+my $dbg = $ENV{'DEBUG'};
+my @config ;	# main array storing hashes of the config file
+my $fmtDate ;
+
+# #############################################################
+# function readConfig: read configuration file and store
+# #############################################################
+sub readConfig()
+	{
+	# in case there is no section at start, loaded in global section
+	my $section = "global" ; 
+	my $secIdx = 0 ;
+
+	# Path to configuration file :
+	my $configFile = $ENV{'SITHARI_CONF'};
+	$configFile ||= "/etc/sithari.conf" ;
+
+	die "Unable to read config file $configFile\n"
+		if (! open CONF, "<",  $configFile) ;
+
+	while (<CONF>)
+		{
+		# let's remove carriage returns
+		chomp ;
+
+		# let's get rid of comments
+		s/#.*$// ;
+
+		# remove empty lines
+		next if (m/^\s*$/) ;
+
+		# remove leading blanks
+		s/^\s+// ;
+
+		# remove ending blanks
+		s/\s+$// ;
+
+		# new section ?
+		if (m/\s*\[.+\]\s*$/)
+			{
+			# remove brackets
+			s/\s*\[// ;
+			s/\]\s*// ;
+
+			# if new section != old section
+			$secIdx++ if ($_ ne $section) ;
+
+			$section = $_ ;
+			print "Section found $section\n" if ($dbg>8) ;
+
+			# Store section name
+			$config[$secIdx]->{"section"} = $section ;
+			next ;
+			}
+
+		next unless /=/;
+		my ($key, $variable) = split(/\s*=\s*/, $_, 2) ;
+
+		# key is stored lowercase, thus allowing mixing case
+		# if it's not a variable
+		$key = lc($key) if !( $key =~ /\$/) ;
+
+		# remove blanks in keys, allowing space
+		$_ = $key ;
+		s/\s//g ;
+		$key = $_ ;
+
+		# variable expansion: replace $SOMETHING by it's 
+		# value declared in the global section
+		$variable =~ s/(\$(\w+))/$config[0]->{$1}/g ;
+
+		# load array
+		$config[$secIdx]->{$key} = $variable ;
+		}
+	close CONF ;
+}
+
+# ############################# MAIN ##########################
+sub main()
+	{
+	$dbg = 0 if (!defined $dbg) ;
+
+	select STDOUT ;   # use this line to send outputs to STDOUT
+
+	&readConfig  ;
+
+	# Let's deal with Logfile 1st
+	print "logfile is: $config[0]->{'logfile'}\n" if ($dbg>8) ;
+
+	if ($config[0]->{'logfile'} eq "STDOUT")
+		{
+		select STDOUT ;
+		}
+	else
+		{
+		if (!open LOGF, ">>", $config[0]->{'logfile'})
+			{
+			&printMsg("Unable to write to logfile $config[0]->{'logfile'}\n" .
+			"Check permissions to create or append to that file\n" .
+			"Using Standard output instead\n");
+
+			select STDOUT ;
+			}
+		else
+			{
+			select LOGF ;
+			open STDERR, '>&LOGF';
+			}
+		}
+
+	$dbg = $config[0]->{'loglevel'} if (defined $config[0]->{'loglevel'}) ;
+
+	&displayConfig() if ($dbg>8) ;
+
+	&checkGlobalParams() ;
+
+	# date of start of program stored
+	my ($day, $month, $year, $hour, $min, $sec) ;
+
+	($sec, $min, $hour, $day, $month, $year, undef, undef, undef) = localtime ;
+	$year += 1_900 ;
+	$month++ ;
+	$fmtDate = sprintf("%d.%02d.%02d", $year, $month, $day) ;
+
+	# create lock file
+	&lock("start") ;
+
+	&printMsg("Start of Sithari") ;
+
+	my $rsyncRC = 0 ;
+	my $sithariExitCode = 0 ;
+
+	# [global] is 0 let's start at 1 ;
+	for (my $secCnt = 1 ; $secCnt < scalar(@config) ; $secCnt++)
+		{
+		$rsyncRC = &sectionProcess($secCnt) ;
+
+		if ($rsyncRC != 0)
+			{
+			# exit with the last non zero rsync return code
+			$sithariExitCode = $rsyncRC ;
+			}
+
+		&printMsg("section $secCnt, return code $rsyncRC, $sithariExitCode") if ($dbg>2) ;
+		}
+	
+	&lock("stop") ;
+	&printMsg("Normal End of Sithari") ;
+	exit($sithariExitCode) ;
+	}
+
+# #############################################################
+# function sectionProcess
+# parameter : $_[0] is section no in $config array
+# #############################################################
+sub sectionProcess()
+	{
+	if (defined $config[$_[0]]->{'disable'})
+		{
+		if ($config[$_[0]]->{'disable'} =~ /true|yes|1/i)
+			{
+			print "\tSection " . $config[$_[0]]->{'section'} . 
+				" is disabled\n" if ($dbg>8) ;
+			return 0 ;
+			}
+		}
+
+	&printMsg("Processing section " . $config[$_[0]]->{'section'}) if ($dbg>1) ;
+
+	my ($srcDir, $toDir, $keepDays, $keepMonths, $keepYears) ;
+
+	$srcDir = $config[$_[0]]->{'source'} ;
+	$toDir = $config[$_[0]]->{'destination'} ;
+
+	# reading section, if not defined let's use global
+	$keepDays = $config[0]->{'days'} ;
+	$keepDays = $config[$_[0]]->{'days'} if (defined $config[$_[0]]->{'days'}) ;
+
+	$keepMonths = $config[0]->{'months'} ;
+	$keepMonths = $config[$_[0]]->{'months'} if (defined $config[$_[0]]->{'months'}) ;
+
+	$keepYears = $config[0]->{'years'} ;
+	$keepYears = $config[$_[0]]->{'years'} if (defined $config[$_[0]]->{'years'}) ;
+
+	print("srcDir=$srcDir, toDir=$toDir, keepDays=$keepDays, " .
+		"keepMonths=$keepMonths, keepYears=$keepYears\n") if ($dbg>9) ;
+
+        if ((not defined $srcDir) or (not defined $toDir) 
+	or (not defined $keepDays) or (not defined $keepMonths) 
+	or (not defined $keepYears))
+		{
+		&printMsg("Configuration parameters missing. Check your config file") ;
+		return 1 ;
+		}
+
+	# we need options here if you want to use rsync options like --password-file 
+	# to check the existence of the remote directory
+	$config[$_[0]]->{'rsyncoptions'} = "" if (!defined $config[$_[0]]->{'rsyncoptions'}) ;
+	$config[0]->{'rsyncoptions'} = "" if (!defined $config[0]->{'rsyncoptions'}) ;
+	my $options = $config[$_[0]]->{'rsyncoptions'} . " " . $config[0]->{'rsyncoptions'} ;
+
+	# let's check the kind of source we have (local, ssh, rsync)
+	# we have to count occurences of '::' to count occurence of ':'
+	my $count = () = $srcDir =~ /::/g;
+
+	if ($count > 0)
+		{
+		# we have a rsync daemon syntax
+		# we can check if the service exist executing
+		# rsync user@machine::service and checking return code
+		my $cmd = $config[0]->{'rsync'} . " " . $options . " " . $srcDir . " 1>/dev/null";
+
+		if (system($cmd))
+			{
+			&printMsg("Rsync directory $srcDir does not exists, skipping.") ;
+			return 2 ;
+			}
+		}
+	elsif ($srcDir =~ /:/)
+		{
+		# we have a remote host syntax
+		my ($host, $rmtDir) = split(/:/, $srcDir) ;
+		my $cmd = $config[0]->{'ssh'} ;
+
+		# let's check remote directory for existence
+		# host is left part. Can be foo@bar
+		if (system $cmd, $host, " [ -d $rmtDir ] ")
+			{
+			&printMsg("Remote directory $srcDir does not exists, skipping.") ;
+			return 3 ;
+			}
+		}
+	else
+		{
+		# we have a local host syntax
+		if (not -d $srcDir)
+			{
+			&printMsg("Local directory $srcDir does not exists, skipping.") ;
+			return 4 ;
+                        }
+		}
+	
+	# Let's check validity of parameters
+	if (not -d $toDir)
+		{
+		&printMsg("Destination directory $toDir does not exists, skipping\n") ;
+		return 5 ;
+		}
+
+	if (-d "$toDir/$fmtDate")
+		{
+		&printMsg("Warning: Today's backup directory " . $toDir . "/" . $fmtDate . 
+		" already exists, overwriting") ;
+		}
+
+	if ($keepDays < 0 or $keepDays > 10_000)
+		{
+		&printMsg("number of days is wrong, skipping section...\n") ;
+		return 6 ;
+		}
+
+	if ($keepMonths < 0 or $keepMonths > 100)
+		{
+		&printMsg("number of months is wrong, skipping section...\n") ;
+		return 7 ;
+		}
+
+	if ($keepYears < 0 or $keepYears > 10)
+		{
+		&printMsg("number of years is wrong, skipping section...\n") ;
+		return 8 ;
+		}
+
+	# if it's not the first run of this backup set ...
+	if ( -f "$toDir/last")
+		{
+		# let's go to last backup dir
+		open LAST, "<", "$toDir/last" ;
+		$_ = <LAST> ; 
+		close LAST ;
+		chomp ; 
+
+		chdir $_ ; 
+
+		my $dir = getcwd ;
+		
+		if (($dir ne $_ ) or (not -d $_))
+			{
+			&printMsg("Local directory $_ of last backup can't be reached, " .
+			"anomaly detected, copying all over again...") ;
+			}
+		else	# good normal case
+			{		
+			if ("$toDir/$fmtDate" eq $dir)
+				{
+				&printMsg("Warning: last backup directory " . $dir . 
+				" is the same as today's. skipping CPIO snapshot copy") ;
+				}
+			else	# good normal case
+				{
+				# let's copy with hard links what we can, for example:
+				#find . -print | cpio -dplm $toDir/$fmtDate 1>/dev/null 2>&1
+				my $cmd = $config[0]->{'find'} . " . -print | " .  
+					  $config[0]->{'cpio'} . " -dplm " .  
+					  $toDir . "/" . $fmtDate .  " 1>/dev/null 2>&1" ;
+
+				print "$cmd\n" if ($dbg>4) ;
+
+				if ( my $rc = system($cmd))
+					{
+					&printMsg("CPIO exit status is non zero! ($rc)") ;
+					}
+				}
+			}
+		}
+
+	# Let's clean older copies once the snapshot of the previous is done
+	&cleanDir($toDir, $keepDays, $keepMonths, $keepYears) ;
+
+	# let's build the command to call rsync with the right arguments
+	# rsync -a --delete $rsyncOptions $srcDir/ $toDir/$fmtDate
+	#
+	my $itemXcl ;
+	my $excludeOption = "" ;
+	my @exclude = () ;
+
+	if (defined $config[$_[0]]->{'exclude'})
+		{
+		@exclude = split(/\s/, $config[$_[0]]->{'exclude'}) ;
+		}
+
+	if (defined $config[0]->{'exclude'})
+		{
+		push @exclude, split(/\s/, $config[0]->{'exclude'}) ;
+		}
+
+	foreach $itemXcl (@exclude)
+		{
+		$excludeOption .= " --exclude=" . $itemXcl ;
+		}
+
+	my $rsyncCmd = $config[0]->{'rsync'} . " -a --delete " . $options . 
+			$excludeOption . " $srcDir/ $toDir/$fmtDate" ;
+
+	print "$rsyncCmd\n" if ($dbg>3) ;
+
+	my $rc ;
+
+	if (!($rc = system($rsyncCmd)))
+		{
+        	&printMsg("Backup successful") ;
+
+		# write last only if return status is okay, so next backup will 
+		# copy only a successfull backup as a source before rsync
+		open LAST, ">", "$toDir/last" ;
+		print LAST "$toDir/$fmtDate\n" ;
+		close LAST ;
+
+		# let's create a symlink "linklast" to the last backup dir here
+		# if successful only, so the link links only to the last successful backup
+		chdir $toDir ;
+		unlink 'linklast' if (( -e "linklast") or ( -l "linklast")) ;
+		symlink($fmtDate, "linklast") ;
+
+		&postexec($_[0], "ok") ;
+		}
+	else
+		{
+		# houston, we got a problem
+		# we have to shift 8 bits the return code of system() (divide by 256) 
+		$rc = $rc>>8 ;
+		&printMsg("Backup unsuccessful return code $rc ($srcDir to $toDir)") ;
+		&postexec($_[0], "error", $rc) ;
+		}
+
+	chmod  0550, "$toDir/$fmtDate" ;
+
+	return $rc ;
+	}
+
+# #############################################################
+# function lock
+# parameter : "start" or "stop"
+# #############################################################
+sub lock()
+	{
+	if ($_[0] eq "start")
+		{
+		die "lockfile " . $config[0]->{"lockfile"} . " already exists.\n" .
+		"Another instance is running ?" if (-e $config[0]->{"lockfile"}) ;
+
+		die "Unable to create lock file" . $config[0]->{"lockfile"}
+			if (! open LOCK, ">",  $config[0]->{"lockfile"}) ;
+
+		close LOCK ;
+		}
+	elsif ($_[0] eq "stop")
+		{
+		unlink $config[0]->{"lockfile"} ;
+		}
+	else
+		{
+		&printMsg("Bad parameter to function lock, should be either start or stop") ;
+		}
+	}
+
+# #############################################################
+# function displayConfig
+# #############################################################
+sub displayConfig()
+	{
+	my $href ; my $role ;
+
+	print scalar(@config) . " sections\n" ;
+
+	for $href ( @config ) 
+		{
+	    	print "[$href->{'section'}] { \n";
+
+	    	for $role ( keys %$href ) 
+			{
+		 	print "	$role=$href->{$role}\n";
+	    		}
+		print "	}\n";
+		}
+	}
+
+# #############################################################
+# function checkGlobalParams
+# #############################################################
+sub checkGlobalParams()
+	{
+	die "cpio not defined in config file\nCheck config file\n" 
+		if (not defined $config[0]->{'cpio'}) ;
+
+	die "Unable to execute cpio\nCheck config file\n" 
+		if (! -x $config[0]->{'cpio'}) ;
+		
+	die "find not defined in config file\nCheck config file\n" 
+		if (not defined $config[0]->{'find'}) ;
+
+	die "Unable to execute find\nCheck config file\n" 
+		if (! -x $config[0]->{'find'}) ;
+		
+	die "rsync not defined in config file\nCheck config file\n" 
+		if (not defined $config[0]->{'rsync'}) ;
+
+	die "Unable to execute rsync\nCheck config file\n" 
+		if (! -x $config[0]->{'rsync'}) ;
+
+	die "lockfile not defined in config file\nCheck config file\n" 
+		if (not defined $config[0]->{'lockfile'}) ;
+		
+	die "SSH not defined in config file\nCheck config file\n" 
+		if (not defined $config[0]->{'ssh'}) ;
+		
+	die "Unable to execute ssh\nCheck config file\n" 
+		if (! -x $config[0]->{'ssh'}) ;
+	}
+
+# #############################################################
+# function cleanDir
+# parameter : destination Dir to clean
+#             days, months, years to keep
+# #############################################################
+# what it does :
+#         Y                  M                   D         NOW
+#  delete | keep 1st of Year | keep 1st of Month | keep all |
+# #############################################################
+sub cleanDir()
+	{
+	my ($toDir, $keepDays, $keepMonths, $keepYears, $backup) ;
+	my %backups ; my $toKeep ;
+	my ($d, $m, $y) ;
+
+	$toDir = $_[0] ;
+	$keepDays = $_[1] ;
+	$keepMonths = $_[2] ;
+	$keepYears = $_[3] ;
+
+	chdir($toDir) ;
+
+	foreach $backup (glob "[12][0-9][0-9][0-9].[01][0-9].[0-3][0-9]")
+		{
+		# 1 : to keep. Initialize hash
+		$backups{$backup} = 1 ;
+		}
+	
+	# actual backup date var read from global variable $fmtDate
+	my ($nowYear, $nowMonth, $nowDay) = split(/\./, $fmtDate) ;
+
+	while (($backup, $toKeep) = each %backups)
+		{
+		($y, $m, $d) = split(/\./, $backup) ;
+
+		# let's check against years to keep. Purge really old ones
+		if ((($nowYear*10000)+($nowMonth*100)+$nowDay) - ($keepYears*10000)
+			>  ($y*10000)+($m*100)+$d)
+			{
+			$backups{$backup} = 0 ;
+			}
+		}
+
+	# Let's fill 2 hashes, marking backups that are first 
+	# appearing in the year and the first in each month
+	my %firstBackupInYear ;
+	my %firstBackupInMonth ;
+	my $first = 1 ;
+	my $previousYear = "" ;
+	my $previousMonth = "" ;
+
+	foreach $backup (sort keys %backups)	# chronological order
+		{
+		($y, $m, $d) = split(/\./, $backup) ;
+
+		if ($first)
+			{
+			$firstBackupInYear{$backup} = 1 ;
+			$firstBackupInMonth{$backup} = 1 ;
+			$first = 0 ;
+			}
+		# check if different year
+		if ($y ne $previousYear)	
+			{
+			# happy new year !
+			$firstBackupInYear{$backup} = 1 ;
+			print "new year ", $y, "\n" if ($dbg>8) ;
+			}
+		else
+			{
+			$firstBackupInYear{$backup} = 0 ;
+			}
+
+		# check if different year+month
+		if ($y.$m ne $previousMonth)
+			{
+			$firstBackupInMonth{$backup} = 1 ;
+			print "new month ", $y.$m, "\n" if ($dbg>8) ;
+			}
+		else
+			{
+			$firstBackupInMonth{$backup} = 0 ;
+			}
+
+		# keep old value for next iteration
+		$previousYear = $y ;
+		$previousMonth = $y . $m ;
+		}
+
+	my ($epochToBackupDir, $epochToNow) ;
+
+	while (($backup, $toKeep) = each %backups)
+		{
+		($y, $m, $d) = split(/\./, $backup) ;
+
+		# timelocal gives seconds since Epoch for a given date. Let's convert to days
+		$epochToBackupDir = timelocal(0, 0, 0, $d, $m-1, $y)/(24*60*60) ;
+		$epochToNow = timelocal(0, 0, 0, $nowDay, $nowMonth-1, $nowYear)/(24*60*60) ;
+
+		 # let's mark for deletion if it is between the number of years
+		 # and the number of months we want to keep a yearly backup
+		 # and it's not the 1st backup of the year
+	        if (($y >= $nowYear - $keepYears)  and
+		    ($y*12+$m < $nowYear*12 + $nowMonth - $keepMonths) and
+		    ($firstBackupInYear{$backup} == 0))
+			{
+			$backups{$backup} = 0 ;
+			}
+
+		# let's mark for deletion if between (now - month) and (now - days)
+		# and i'ts not the 1st backup of the month
+		if (($y*12+$m >= $nowYear*12 + $nowMonth - $keepMonths) and
+           	    ($epochToBackupDir < $epochToNow - $keepDays) and
+		    ($firstBackupInMonth{$backup} == 0))
+	   		{
+			$backups{$backup} = 0 ;
+			}
+		}
+
+	# Let's proceed to the cleaning...
+	foreach $backup (sort keys %backups)	# chronological order
+		{
+		if (!$backups{$backup})
+			{
+			&printMsg("Erasing backup $backup ...") if ($dbg>2) ;
+			rmtree $backup ;
+			&printMsg("Done erasing backup $backup.") if ($dbg>2) ;
+			}
+		}
+	}
+
+# #############################################################
+# function printMsg
+# parameter : text to print
+# #############################################################
+sub printMsg()
+	{
+	my ($Msgsec, $Msgmin, $Msghour, $Msgday, $Msgmonth, $Msgyear, 
+		undef, undef, undef) = localtime ;
+
+        $Msgyear += 1_900 ;
+        $Msgmonth++ ;
+
+        printf("$Msgyear-%02d-%02d %02d:%02d:%02d " . $_[0] . "\n",
+               $Msgmonth, $Msgday, $Msghour, $Msgmin, $Msgsec) ;
+
+	}
+## #############################################################
+# function postexec
+# parameters : 		- section no
+#			- string "ok" or "error", 
+#			- return code
+# #############################################################
+sub postexec()
+	{
+	my $cmd = "" ;
+
+	if ($_[1] eq "ok")
+		{
+		# 1st global postexec command. if section command is defined, it's prefered
+		$cmd = $config[0]->{postexecok} if (defined $config[0]->{postexecok}) ;
+		$cmd = $config[$_[0]]->{postexecok} if (defined $config[$_[0]]->{postexecok});
+		}
+	elsif ($_[1] eq "error")
+		{
+		# we had the return code as last argument passed to the command postexecerror
+		# this user written script should manage this value
+		$cmd = $config[0]->{postexecerror} . " " . $_[2] if (defined $config[0]->{postexecerror}) ;
+		$cmd = $config[$_[0]]->{postexecerror} . " " . $_[2] if (defined $config[$_[0]]->{postexecerror});
+		}
+
+	my $msg = "postexec $_[1] " . $cmd ;
+	&printMsg($msg) if ($dbg>2) ;
+
+	if ((defined $cmd) && ($cmd ne ""))
+		{
+		if (system($cmd) == -1)
+			{
+			&printMsg("Can't exec $cmd") ;
+			}
+		}
+	}
+
+#############################################################
+main() ;
+# #### That's the end #########################################
